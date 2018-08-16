@@ -4,7 +4,9 @@ require 'selenium-webdriver'
 
 module Plugin::Mikuttdeck
 
-  Error = Class.new(StandardError)
+  BaseError = Class.new(StandardError)
+  Error = Class.new(BaseError)
+  StateError = Class.new(BaseError)
 
   # Selenium::WebDriver のラッパークラス。メソッドの呼び出しは Deferred される
   class DriverProxy
@@ -14,17 +16,46 @@ module Plugin::Mikuttdeck
     def initialize(browser, option = {}, url)
       @thread = SerialThreadGroup.new(deferred: Deferred)
 
-      @driver = parallel do
-        driver = Selenium::WebDriver.for browser, option
-        driver.get(url)
+      @proc = Thread.new do
+        @driver = Selenium::WebDriver.for browser, option
+        @driver.get(url)
         # TweetDeckが読み込み終わるまで待つ
+        # TODO: ちゃんとする
         sleep 4
-        driver
+        @driver
       end
     end
 
+    def destroy(*args, &blk)
+      thread.new do
+        begin
+          @proc&.join
+        ensure
+          break if @destroyed
+          @destroyed = true
+          @driver&.quit
+          @driver = nil
+        end
+      end
+    end
+
+    def at_exit
+      @driver&.quit unless @destroyed
+    end
+  
     def method_missing(name, *args, &blk)
       thread.new do
+        raise StateError if @destroyed
+        if @proc
+          begin
+            @proc.join
+          rescue => e
+            @driver&.quit
+            @destroyed = true
+            raise Error, Plugin[:mikuttdeck]._('mikuttdeck: ブラウザの起動に失敗しました。')
+          end
+          @proc = nil
+        end
         @driver.__send__(name, *args, &blk)
       end
     end
@@ -38,41 +69,38 @@ module Plugin::Mikuttdeck
 
     def initialize(browser, option = {})
       @driver = DriverProxy.new(browser, option, 'https://tweetdeck.twitter.com')
+      @js = {}
       @status = :initialized
     end
 
     def start
       Deferred.new do
-        if @status == :initialized
-          @status = :starting
-          +@driver.find_element(:id, 'container').trap {|e|
-            case e
-            when Selenium::WebDriver::Error::NoSuchElementError
-              Deferred.fail(Error.new('mikuttdeck: TweetDeckにログインしていないようです。'))
-            else
-              Deferred.fail(e)
-            end
-          }
-          columns = (+self.columns).select{|c| c.type == :home_timeline }
-          if columns.empty?
-            raise Error, Plugin[:mikuttdeck]._(
-              'mikuttdeck: TweetDeckでつかえるカラムが開かれてないようです。' \
-                'mikutterにログインしているのと同じアカウントでログインし、Homeカラムを開いてください。'
-            )
+        raise StateError unless @status == :initialized
+        @status = :starting
+        +@driver.find_element(:id, 'container').trap {|e|
+          case e
+          when Selenium::WebDriver::Error::NoSuchElementError
+            Deferred.fail(Error.new('mikuttdeck: TweetDeckにログインしていないようです。'))
+          else
+            Deferred.fail(e)
           end
-          @columns = columns
-          refresh
-          @status = :running
-        else
-          raise Error, Plugin[:mikuttdeck]._('mikuttdeck state error')
+        }
+        columns = (+get_columns).select{|c| c.type == :home_timeline }
+        if columns.empty?
+          raise Error, Plugin[:mikuttdeck]._(
+            'mikuttdeck: TweetDeckでつかえるカラムが開かれてないようです。' \
+              'mikutterにログインしているのと同じアカウントでログインし、Homeカラムを開いてください。'
+          )
         end
+        @columns = columns
+        @status = :running
+        refresh
       end
     end
 
     def refresh
-      Deferred.new do
-        fetch
-      end
+      return unless @status == :running
+      fetch
       Reserver.new(4) do
         Deferred.new do
           refresh
@@ -81,22 +109,34 @@ module Plugin::Mikuttdeck
     end
 
     def fetch
-      @columns.each do |column|
-        ids = +@driver.execute_script(
-          file_get_contents(File.expand_path(File.join(File.dirname(__FILE__), 'home_timeline.js'))),
-          column.element,
-          column.latest
-        )
-        column.latest = ids.first
-        messages = +((column.service.twitter/'statuses/lookup').messages(id: ids.join(',')))
-        Plugin.call(:update, column.service, messages)
-        Plugin.call(:mention, column.service, messages.select{ |m| m.to_me? })
-        Plugin.call(:mypost, column.service, messages.select{ |m| m.from_me? })
-        messages
+      Deferred.new do
+        @columns.each do |column|
+          ids = +@driver.execute_script(
+            @js[column.type] ||=
+              file_get_contents(File.expand_path(File.join(File.dirname(__FILE__), "#{ column.type }.js"))),
+            column.element,
+            column.latest
+          )
+          column.latest = ids.first
+          messages = +((column.service.twitter/'statuses/lookup').messages(id: ids.join(',')))
+          Plugin.call(:update, column.service, messages)
+          Plugin.call(:mention, column.service, messages.select{ |m| m.to_me? })
+          Plugin.call(:mypost, column.service, messages.select{ |m| m.from_me? })
+          messages
+        end
       end
     end
+
+    def destroy
+      @driver.destroy unless @status == :destroyed
+      @status = :destroyed
+    end
   
-    def columns
+    def at_exit
+      @driver.at_exit
+    end
+  
+    private def get_columns
       Deferred.new do
         (+@driver.find_elements(:css,
           '#column-navigator > div.js-column-nav-list > ul.js-int-scroller > li.column-nav-item'
@@ -126,12 +166,6 @@ module Plugin::Mikuttdeck
         end.select {|c| c.service }
       end
     end
-
-    def close
-      @driver.close.next {
-        @status = :closed
-      }
-    end
   end
 
   class Deck::Column < Struct.new(:element, :type, :service, :latest)
@@ -149,31 +183,31 @@ end
 Plugin.create(:mikuttdeck) do
 
   def start
-    if UserConfig[:mikuttdeck_browser].empty?
-      activity :system, _(
-        'mikuttdeck: ブラウザが設定されていません。設定ダイアログでブラウザを設定して、その後mikuttdeckを有効にし直してください。'
-      )
-      return Deferred.new
-    end
     Deferred.new do
+      if UserConfig[:mikuttdeck_browser].empty?
+        raise Plugin::Mikuttdeck::Error,
+          'mikuttdeck: ブラウザが設定されていません。設定ダイアログでブラウザを設定して、その後mikuttdeckを有効にし直してください。'
+      end
       @deck = Plugin::Mikuttdeck::Deck.new(
         UserConfig[:mikuttdeck_browser].downcase.to_sym,
         UserConfig[:mikuttdeck_selenium_option] || {}
       )
-      @deck.start.trap {|e|
-        #case e
-        #when Plugin::Mikuttdeck::Error
-          activity :system, e.message
-        #else
-        #  Deferred.trap(e)
-        #end
-      }
+      @deck.start
+    end.trap {|e|
+      @deck&.destroy
+      @deck = nil
+      case e
+      when Plugin::Mikuttdeck::Error
+        activity :system, e.message
+      else
+        Deferred.fail(e)
+      end
+    }
     end
-  end
 
   def stop
     if @deck
-      @deck.close
+      @deck.destroy
       @deck = nil
     end
   end
@@ -187,6 +221,10 @@ Plugin.create(:mikuttdeck) do
     if key == :mikuttdeck_enable
       if newval then start else stop end
     end
+  end
+
+  at_exit do
+    @deck&.at_exit
   end
 
   start if UserConfig[:mikuttdeck_enable]
