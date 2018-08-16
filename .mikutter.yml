@@ -1,0 +1,12 @@
+---
+slug: :mikuttdeck
+depends:
+  mikutter: 3.7.4
+  plugin:
+  - settings
+  - twitter
+  - uitranslator
+version: '0.1.0'
+author: takemaro
+name: mikuttdeck
+description: TweetDeckからデータを吸い上げて準リアルタイム更新を実現する
