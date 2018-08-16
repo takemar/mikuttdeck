@@ -6,6 +6,7 @@ module Plugin::Mikuttdeck
 
   BaseError = Class.new(StandardError)
   Error = Class.new(BaseError)
+  DeckError = Class.new(Error)
   StateError = Class.new(BaseError)
 
   # Selenium::WebDriver のラッパークラス。メソッドの呼び出しは Deferred される
@@ -80,14 +81,14 @@ module Plugin::Mikuttdeck
         +@driver.find_element(:id, 'container').trap {|e|
           case e
           when Selenium::WebDriver::Error::NoSuchElementError
-            Deferred.fail(Error.new('mikuttdeck: TweetDeckにログインしていないようです。'))
+            Deferred.fail(DeckError.new(Plugin[:mikuttdeck]._('mikuttdeck: TweetDeckにログインしていないようです。')))
           else
             Deferred.fail(e)
           end
         }
         columns = (+get_columns).select{|c| c.type == :home_timeline }
         if columns.empty?
-          raise Error, Plugin[:mikuttdeck]._(
+          raise DeckError, Plugin[:mikuttdeck]._(
             'mikuttdeck: TweetDeckでつかえるカラムが開かれてないようです。' \
               'mikutterにログインしているのと同じアカウントでログインし、Homeカラムを開いてください。'
           )
@@ -186,7 +187,7 @@ Plugin.create(:mikuttdeck) do
     Deferred.new do
       if UserConfig[:mikuttdeck_browser].empty?
         raise Plugin::Mikuttdeck::Error,
-          'mikuttdeck: ブラウザが設定されていません。設定ダイアログでブラウザを設定して、その後mikuttdeckを有効にし直してください。'
+          _('mikuttdeck: ブラウザが設定されていません。設定ダイアログでブラウザを設定して、その後mikuttdeckを有効にし直してください。')
       end
       @deck = Plugin::Mikuttdeck::Deck.new(
         UserConfig[:mikuttdeck_browser].downcase.to_sym,
@@ -194,14 +195,17 @@ Plugin.create(:mikuttdeck) do
       )
       @deck.start
     end.trap {|e|
-      @deck&.destroy
-      @deck = nil
       case e
+      when Plugin::Mikuttdeck::DeckError
+        activity :system, e.message
+        break
       when Plugin::Mikuttdeck::Error
         activity :system, e.message
       else
         Deferred.fail(e)
       end
+      @deck&.destroy
+      @deck = nil
     }
     end
 
