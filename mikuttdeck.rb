@@ -18,7 +18,8 @@ module Plugin::Mikuttdeck
       @thread = SerialThreadGroup.new(deferred: Deferred)
 
       @proc = Thread.new do
-        @driver = Selenium::WebDriver.for browser, option
+        # 第2引数は破壊される場合があるので
+        @driver = Selenium::WebDriver.for browser, option.dup
         @driver.get(url)
         # TweetDeckが読み込み終わるまで待つ
         # TODO: ちゃんとする
