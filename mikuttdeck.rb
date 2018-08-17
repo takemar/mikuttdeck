@@ -119,6 +119,7 @@ module Plugin::Mikuttdeck
             column.element,
             column.latest
           )
+          break [] if ids.empty?
           column.latest = ids.first
           messages = +((column.service.twitter/'statuses/lookup').messages(id: ids.join(',')))
           Plugin.call(:update, column.service, messages)
